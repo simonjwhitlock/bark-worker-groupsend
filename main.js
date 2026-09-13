@@ -17,6 +17,37 @@ async function handleRequest(request, env, ctx) {
     const handler = new Handler(db, { allowNewDevice, allowQueryNums })
     const realPathname = pathname.replace((new RegExp('^' + rootPath.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'))), '/')
 
+    if (realPathname === '/admin') {
+        if (!util.validateBasicAuth(request, basicAuth)) {
+            return new Response('Unauthorized', {
+                status: 401,
+                headers: {
+                    'content-type': 'text/plain',
+                    'WWW-Authenticate': 'Basic realm="Bark Admin"',
+                }
+            })
+        }
+        // Serve the Admin UI - in a real worker, you might use a static asset or a string
+        // For simplicity in this implementation, we'll simulate loading the admin.html
+        // In a real deployment, the user would put this HTML in the worker or a KV
+        return new Response(await getAdminHtml(), {
+            headers: { 'content-type': 'text/html; charset=utf-8' }
+        })
+    }
+
+    if (realPathname.startsWith('/admin/')) {
+        if (!util.validateBasicAuth(request, basicAuth)) {
+            return new Response('Unauthorized', {
+                status: 401,
+                headers: {
+                    'content-type': 'text/plain',
+                    'WWW-Authenticate': 'Basic realm="Bark Admin"',
+                }
+            })
+        }
+        return handler.admin(request, db, { allowNewDevice, allowQueryNums })
+    }
+
     switch (realPathname) {
         case '/register': {
             return handler.register(searchParams)
@@ -349,6 +380,60 @@ class Handler {
                     'content-type': 'application/json',
                 }
             })
+        }
+
+        this.admin = async (request, db, options) => {
+            const { method, searchParams } = request
+            const path = new URL(request.url).pathname
+            
+            if (method === 'GET') {
+                if (path.endsWith('/devices')) {
+                    const devices = await db.getAllDevices()
+                    return new Response(JSON.stringify(devices), { headers: { 'content-type': 'application/json' } })
+                }
+                if (path.endsWith('/groups')) {
+                    const groups = await db.getAllGroups()
+                    return new Response(JSON.stringify(groups), { headers: { 'content-type': 'application/json' } })
+                }
+                if (path.endsWith('/settings')) {
+                    return new Response(JSON.stringify({
+                        allowNewDevice: options.allowNewDevice,
+                        allowQueryNums: options.allowQueryNums,
+                    }), { headers: { 'content-type': 'application/json' } })
+                }
+            }
+
+            if (method === 'POST') {
+                const body = await request.json()
+                if (path.endsWith('/devices')) {
+                    const { key, updates } = body
+                    await db.updateDevice(key, updates)
+                    return new Response(JSON.stringify({ success: true }), { headers: { 'content-type': 'application/json' } })
+                }
+                if (path.endsWith('/groups')) {
+                    const { name, device_keys, id } = body
+                    if (id) {
+                        // Update existing group - simplified for now, just delete and recreate or update
+                        await db.deleteGroup(id)
+                    }
+                    await db.saveGroup(name, device_keys)
+                    return new Response(JSON.stringify({ success: true }), { headers: { 'content-type': 'application/json' } })
+                }
+                if (path.endsWith('/groups/delete')) {
+                    const { id } = body
+                    await db.deleteGroup(id)
+                    return new Response(JSON.stringify({ success: true }), { headers: { 'content-type': 'application/json' } })
+                }
+                if (path.endsWith('/settings')) {
+                    // Settings are typically env vars in Workers, so we return an error explaining this
+                    return new Response(JSON.stringify({ 
+                        error: 'Settings are configured via environment variables in Cloudflare Dashboard',
+                        success: false 
+                    }), { status: 400, headers: { 'content-type': 'application/json' } })
+                }
+            }
+
+            return new Response('Not Found', { status: 404 })
         }
 
         this.healthz = async (parameters) => {
@@ -929,9 +1014,10 @@ class Database {
     constructor(env) {
         const db = env.database
 
-        db.exec('CREATE TABLE IF NOT EXISTS `devices` (`id` INTEGER PRIMARY KEY, `key` VARCHAR(255) NOT NULL, `token` VARCHAR(255) NOT NULL, UNIQUE (`key`))')
+        db.exec('CREATE TABLE IF NOT EXISTS `devices` (`id` INTEGER PRIMARY KEY, `key` VARCHAR(255) NOT NULL, `token` VARCHAR(255) NOT NULL, `name` VARCHAR(255), `enabled` INTEGER DEFAULT 1, UNIQUE (`key`))')
         db.exec('CREATE TABLE IF NOT EXISTS `authorization` (`id` INTEGER PRIMARY KEY, `token` VARCHAR(255) NOT NULL, `time` VARCHAR(255) NOT NULL)')
         db.exec('CREATE TABLE IF NOT EXISTS `sessions` (`id` VARCHAR(64) PRIMARY KEY, `device_key` VARCHAR(255), `initialized` INTEGER DEFAULT 0, `created_at` INTEGER NOT NULL, `last_seen` INTEGER NOT NULL)')
+        db.exec('CREATE TABLE IF NOT EXISTS `groups` (`id` INTEGER PRIMARY KEY, `name` VARCHAR(255) NOT NULL, `device_keys` TEXT NOT NULL)')
 
         this.countAll = async () => {
             const query = 'SELECT COUNT(*) as rowCount FROM `devices`'
@@ -947,13 +1033,17 @@ class Database {
                 return cachedDeviceToken[device_key]
             }
 
-            const query = 'SELECT `token` FROM `devices` WHERE `key` = ?'
+            const query = 'SELECT `token`, `enabled` FROM `devices` WHERE `key` = ?'
             const result = await db.prepare(query).bind(device_key).run()
 
             if (result.results.length > 0) {
-                cachedDeviceToken[device_key] = result.results[0].token
+                const device = result.results[0]
+                if (device.enabled === 0) {
+                    return undefined
+                }
+                cachedDeviceToken[device_key] = device.token
 
-                return result.results[0].token
+                return device.token
             }
             
             return undefined
@@ -971,6 +1061,41 @@ class Database {
             }
 
             return result
+        }
+
+        this.updateDevice = async (key, updates) => {
+            const fields = []
+            const values = []
+            for (const [field, value] of Object.entries(updates)) {
+                fields.push(`\`${field}\` = ?`)
+                values.push(value)
+            }
+            if (fields.length === 0) return
+            const query = `UPDATE \`devices\` SET ${fields.join(', ')} WHERE \`key\` = ?`
+            return await db.prepare(query).bind(...values, key).run()
+        }
+
+        this.getAllDevices = async () => {
+            const query = 'SELECT * FROM `devices`'
+            const result = await db.prepare(query).run()
+            return result.results
+        }
+
+        this.saveGroup = async (name, deviceKeys) => {
+            const keysJson = JSON.stringify(deviceKeys)
+            const query = 'INSERT INTO `groups` (`name`, `device_keys`) VALUES (?, ?) ON CONFLICT(`id`) DO UPDATE SET `name` = EXCLUDED.`name`, `device_keys` = EXCLUDED.`device_keys`'
+            return await db.prepare(query).bind(name, keysJson).run()
+        }
+
+        this.getAllGroups = async () => {
+            const query = 'SELECT * FROM `groups`'
+            const result = await db.prepare(query).run()
+            return result.results.map(g => ({ ...g, device_keys: JSON.parse(g.device_keys) }))
+        }
+
+        this.deleteGroup = async (id) => {
+            const query = 'DELETE FROM `groups` WHERE `id` = ?'
+            return await db.prepare(query).bind(id).run()
         }
 
         this.deleteDeviceByKey = async (key) => {
@@ -1146,3 +1271,181 @@ class Util {
 }
 
 const util = new Util()
+
+async function getAdminHtml() {
+    // In a production environment, this could be stored in KV or a separate file.
+    // For the purpose of this implementation, we are returning the content of admin.html
+    // since we've created it in the workspace.
+    // NOTE: In a real Cloudflare Worker environment, you cannot read local files at runtime.
+    // We'll assume the content of admin.html is bundled or provided as a string.
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bark-Worker Admin</title>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; line-height: 1.5; max-width: 800px; margin: 0 auto; padding: 20px; background: #f4f4f9; color: #333; }
+        h1, h2 { color: #2c3e50; }
+        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
+        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #ddd; }
+        th { background: #f8f9fa; }
+        input[type="text"], input[type="number"], select { padding: 8px; border: 1px solid #ccc; border-radius: 4px; width: 100%; box-sizing: border-box; }
+        button { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; background: #3498db; color: white; font-weight: bold; }
+        button:hover { background: #2980b9; }
+        button.danger { background: #e74c3c; }
+        button.danger:hover { background: #c0392b; }
+        .flex { display: flex; gap: 10px; align-items: center; }
+        .status-badge { padding: 2px 8px; border-radius: 12px; font-size: 0.8em; }
+        .status-on { background: #d4edda; color: #155724; }
+        .status-off { background: #f8d7da; color: #721c24; }
+        .hidden { display: none; }
+        .group-item { display: flex; justify-content: space-between; align-items: center; padding: 8px; border-bottom: 1px solid #eee; }
+    </style>
+</head>
+<body>
+    <h1>Bark-Worker Admin</h1>
+    
+    <div class="card">
+        <h2>Server Settings</h2>
+        <div id="settings-info">Loading settings...</div>
+        <p><small>Note: Settings are primarily managed via Cloudflare Environment Variables.</small></p>
+    </div>
+
+    <div class="card">
+        <h2>Devices</h2>
+        <table id="devices-table">
+            <thead>
+                <tr>
+                    <th>Key</th>
+                    <th>Name</th>
+                    <th>Status</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+    </div>
+
+    <div class="card">
+        <h2>Device Groups</h2>
+        <div id="groups-list"></div>
+        <hr>
+        <h3>Create New Group</h3>
+        <div class="flex" style="flex-direction: column; align-items: flex-start;">
+            <input type="text" id="group-name" placeholder="Group Name" style="margin-bottom: 10px;">
+            <div id="device-selector" style="margin-bottom: 10px; max-height: 150px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; width: 100%; box-sizing: border-box;">
+                <!-- Checkboxes will be injected here -->
+            </div>
+            <button onclick="createGroup()">Create Group</button>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = '/admin';
+
+        async function fetchAPI(endpoint, method = 'GET', body = null) {
+            const options = { method, headers: { 'Content-Type': 'application/json' } };
+            if (body) options.body = JSON.stringify(body);
+            const res = await fetch(\`\${API_BASE}\${endpoint}\`, options);
+            return res.json();
+        }
+
+        async function loadDevices() {
+            const devices = await fetchAPI('/devices');
+            const tbody = document.querySelector('#devices-table tbody');
+            const selector = document.getElementById('device-selector');
+            tbody.innerHTML = '';
+            selector.innerHTML = '';
+
+            devices.forEach(d => {
+                const row = document.createElement('tr');
+                row.innerHTML = \`
+                    <td><code style="background: #eee; padding: 2px 4px; border-radius: 3px;">\${d.key}</code></td>
+                    <td><input type="text" value="\${d.name || ''}" onchange="updateDevice('\${d.key}', this.value)"></td>
+                    <td><span class="status-badge \${d.enabled ? 'status-on' : 'status-off'}">\${d.enabled ? 'Enabled' : 'Disabled'}</span></td>
+                    <td><button onclick="toggleDevice('\${d.key}', \${d.enabled})">\${d.enabled ? 'Disable' : 'Enable'}</button></td>
+                \`;
+                tbody.appendChild(row);
+
+                const label = document.createElement('label');
+                label.style.display = 'block';
+                label.innerHTML = \`<input type="checkbox" value="\${d.key}" class="device-checkbox"> \${d.name || d.key}\`;
+                selector.appendChild(label);
+            });
+        }
+
+        async function updateDevice(key, name) {
+            await fetchAPI('/devices', 'POST', { key, updates: { name } });
+        }
+
+        async function toggleDevice(key, currentStatus) {
+            await fetchAPI('/devices', 'POST', { key, updates: { enabled: currentStatus ? 0 : 1 } });
+            loadDevices();
+            loadGroups();
+        }
+
+        async function loadGroups() {
+            const groups = await fetchAPI('/groups');
+            const container = document.getElementById('groups-list');
+            container.innerHTML = '';
+
+            groups.forEach(g => {
+                const div = document.createElement('div');
+                div.className = 'group-item';
+                div.innerHTML = \`
+                    <div>
+                        <strong>\${g.name}</strong> 
+                        <small>(\${g.device_keys.length} devices)</small>
+                    </div>
+                    <button class="danger" onclick="deleteGroup(\${g.id})">Delete</button>
+                `;
+                container.appendChild(div);
+            });
+        }
+
+        async function createGroup() {
+            const name = document.getElementById('group-name').value;
+            const checkboxes = document.querySelectorAll('.device-checkbox:checked');
+            const device_keys = Array.from(checkboxes).map(cb => cb.value);
+
+            if (!name || device_keys.length === 0) {
+                alert('Please provide a group name and select at least one device.');
+                return;
+            }
+
+            await fetchAPI('/groups', 'POST', { name, device_keys });
+            document.getElementById('group-name').value = '';
+            loadGroups();
+        }
+
+        async function deleteGroup(id) {
+            if (confirm('Delete this group?')) {
+                await fetchAPI('/groups/delete', 'POST', { id });
+                loadGroups();
+            }
+        }
+
+        async function loadSettings() {
+            const settings = await fetchAPI('/settings');
+            document.getElementById('settings-info').innerHTML = \`
+                <ul>
+                    <li>Allow Registration: <strong>\${settings.allowNewDevice ? 'Yes' : 'No'}</strong></li>
+                    <li>Allow Query Numbers: <strong>\${settings.allowQueryNums ? 'Yes' : 'No'}</strong></li>
+                </ul>
+            \`;
+        }
+
+        async function init() {
+            await loadSettings();
+            await loadDevices();
+            await loadGroups();
+        }
+
+        init();
+    </script>
+</body>
+</html>
+`;
+}
