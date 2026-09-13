@@ -1400,7 +1400,7 @@ async function getAdminHtml() {
                         <small>(\${g.device_keys.length} devices)</small>
                     </div>
                     <button class="danger" onclick="deleteGroup(\${g.id})">Delete</button>
-                `;
+                \`;
                 container.appendChild(div);
             });
         }
