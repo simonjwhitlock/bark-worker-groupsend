@@ -1305,7 +1305,7 @@ async function getAdminHtml() {
     </style>
 </head>
 <body>
-    <h1>Bark-Worker Admin</h1>
+    <h1 style="color: #2980b9;">Bark-Worker Admin v1.0</h1>
     
     <div class="card">
         <h2>Server Settings</h2>
