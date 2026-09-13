@@ -11,7 +11,7 @@
     "d1_databases": [
         {
             "binding": "database",
-            "database_name": "database-bark",
+            "database_name": "database-bark-groupsend",
             "database_id": "<unique-ID-for-your-database>"
         }
     ],
